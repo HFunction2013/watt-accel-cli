@@ -5,8 +5,7 @@ watt-accel —— Watt Toolkit(Steam++) 网络加速模块的独立 CLI 提取�
 =====================================================================
 
 把 Watt Toolkit(原 Steam++) 的"网络加速"模块核心单独提取为命令行工具，
-**零第三方依赖**，仅使用 Python 3.8+ 标准库（urllib / socket / asyncio / json /
-argparse / subprocess / threading 等），可直接运行。
+**仅依赖 dnspython**，使用 Python 3.8+ 标准库 + dnspython。
 
 与原模块的对应关系（源码见 https://github.com/BeyondDimension/SteamTools ）：
 
@@ -35,7 +34,6 @@ argparse / subprocess / threading 等），可直接运行。
   python3 watt_accel.py flushdns            # 刷新系统 DNS 缓存
 
 许可证：本文件为 SteamTools(GPL-3.0) 网络加速模块的衍生作品，按 GPL-3.0 分发。
-详见随附 LICENSE 文件。
 """
 
 from __future__ import annotations
@@ -56,7 +54,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib import request as urllib_request
 
-__version__ = "1.2.0"
+# dnspython 库
+import dns.resolver
+import dns.exception
+import dns.rdatatype
+
+__version__ = "1.3.0"  # 升级版本号，标记使用 dnspython
 
 # ---------------------------------------------------------------------------
 # 常量：与 SteamTools 原模块保持一致
@@ -355,202 +358,86 @@ def collect_listen_domains(selected) -> list:
     return domains
 
 # ---------------------------------------------------------------------------
-# 域名解析：系统 DNS / 自定义 DNS(UDP+TCP) / DoH
+# 域名解析：使用 dnspython 库
 # ---------------------------------------------------------------------------
-def _encode_name(name: str) -> bytes:
-    out = b""
-    for label in name.rstrip(".").split("."):
-        b = label.encode("idna")
-        out += bytes([len(b)]) + b
-    return out + b"\x00"
 
-
-def _decode_name(data: bytes, offset: int):
-    """解析 DNS 报文中的域名（支持压缩指针），返回 (name, 新偏移)。"""
-    labels = []
-    jumped = False
-    pos = offset
-    end = offset
-    while True:
-        if pos >= len(data):
-            break
-        length = data[pos]
-        if length == 0:
-            pos += 1
-            if not jumped:
-                end = pos
-            break
-        if length & 0xC0 == 0xC0:
-            if pos + 1 >= len(data):
-                break
-            ptr = ((length & 0x3F) << 8) | data[pos + 1]
-            if not jumped:
-                end = pos + 2
-            jumped = True
-            pos = ptr
-            continue
-        pos += 1
-        if pos + length > len(data):
-            break
-        # DNS 名称实际为 ASCII(punycode)，idna codec 不支持 replace 错误处理
-        labels.append(data[pos:pos + length].decode("ascii", "replace"))
-        pos += length
-    return ".".join(labels), end
-
-
-def build_dns_query(name: str, qtype: int) -> bytes:
-    query_id = random.randint(0, 0xFFFF)
-    header = struct.pack(">HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
-    question = _encode_name(name) + struct.pack(">HH", qtype, 1)
-    return header + question
-
-
-def parse_dns_response(data: bytes):
-    """解析 DNS 应答，返回 [('A'|'AAAA'|'CNAME', value), ...]（跳过 OPT 记录）。"""
-    if len(data) < 12:
-        return []
-    qdcount, ancount = struct.unpack(">HH", data[4:8])
-    pos = 12
-    for _ in range(qdcount):  # 跳过问题区
-        _, pos = _decode_name(data, pos)
-        pos += 4
-    answers = []
-    for _ in range(ancount):
-        _, pos = _decode_name(data, pos)
-        if pos + 10 > len(data):
-            break
-        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
-        pos += 10
-        if pos + rdlen > len(data):
-            break
-        rdata = data[pos:pos + rdlen]
-        pos += rdlen
-        if rclass != 1:  # 仅 IN 类
-            continue
-        if rtype == 1 and rdlen == 4:
-            answers.append(("A", socket.inet_ntop(socket.AF_INET, rdata)))
-        elif rtype == 28 and rdlen == 16:
-            answers.append(("AAAA", socket.inet_ntop(socket.AF_INET6, rdata)))
-        elif rtype == 5:
-            name, _ = _decode_name(data, pos - rdlen)
-            answers.append(("CNAME", name))
-        # 其他类型(OPT 等)忽略
-    return answers
-
-
-def dns_query_udp(name: str, server: str, qtype: int, timeout: float = DNS_TIMEOUT) -> list:
-    query = build_dns_query(name, qtype)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
+def resolve_system(domain: str, qtype: int) -> str | None:
+    """使用系统 DNS 解析域名。"""
+    rdtype = 'A' if qtype == 1 else 'AAAA'
     try:
-        for _ in range(2):  # 至多重试一次
-            sock.sendto(query, (server, 53))
-            data, _ = sock.recvfrom(4096)
-            if len(data) >= 2 and data[0:2] == query[0:2]:
-                if len(data) >= 4 and data[2] & 0x02:  # TC 截断 → 走 TCP
-                    return dns_query_tcp(name, server, qtype, timeout)
-                return parse_dns_response(data)
-    except socket.timeout:
+        answers = dns.resolver.resolve(domain, rdtype, lifetime=DNS_TIMEOUT)
+        for rdata in answers:
+            return str(rdata)
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
         pass
-    finally:
-        sock.close()
-    return []
-
-
-def dns_query_tcp(name: str, server: str, qtype: int, timeout: float = DNS_TIMEOUT) -> list:
-    query = build_dns_query(name, qtype)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    try:
-        sock.connect((server, 53))
-        sock.sendall(struct.pack(">H", len(query)) + query)
-        length_data = b""
-        while len(length_data) < 2:
-            chunk = sock.recv(2 - len(length_data))
-            if not chunk:
-                return []
-            length_data += chunk
-        (length,) = struct.unpack(">H", length_data)
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(length - len(data))
-            if not chunk:
-                return []
-            data += chunk
-        return parse_dns_response(data)
-    except (socket.timeout, OSError):
-        return []
-    finally:
-        sock.close()
+    return None
 
 
 def resolve_with_dns_server(domain: str, server: str, qtype: int) -> str | None:
-    answers = dns_query_udp(domain, server, qtype)
-    # 跟随 CNAME 链继续查询
-    seen = {domain.lower()}
-    for _ in range(8):
-        for rtype, value in answers:
-            if rtype in ("A", "AAAA"):
-                return value
-        cnames = [v for r, v in answers if r == "CNAME"]
-        if not cnames:
-            return None
-        nxt = cnames[-1].lower()
-        if nxt in seen:
-            return None
-        seen.add(nxt)
-        answers = dns_query_udp(nxt, server, qtype)
+    """使用指定 DNS 服务器解析域名，自动跟随 CNAME 链。"""
+    # 创建独立的解析器
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_TIMEOUT * 2
+    resolver.nameservers = [server]
+    
+    rdtype = 'A' if qtype == 1 else 'AAAA'
+    
+    try:
+        # dnspython 自动处理 CNAME 链
+        answers = resolver.resolve(domain, rdtype)
+        for rdata in answers:
+            return str(rdata)
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
+        pass
     return None
 
 
 def resolve_with_doh(domain: str, doh_url: str, qtype: int, timeout: float = DNS_TIMEOUT) -> str | None:
-    type_name = "AAAA" if qtype == 28 else "A"
-    sep = "&" if "?" in doh_url else "?"
-    url = "{}{}name={}&type={}".format(doh_url, sep, urllib_request.quote(domain), type_name)
-    req = urllib_request.Request(url, headers={
-        "Accept": "application/dns-json",
-        "User-Agent": USER_AGENT,
-    })
+    """通过 DoH (DNS over HTTPS) 解析域名，使用 dnspython 的 DoH 支持。"""
+    rdtype = 'A' if qtype == 1 else 'AAAA'
+    
     try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            obj = json.loads(resp.read().decode("utf-8"))
-        for ans in obj.get("Answer", []):
-            if ans.get("type") in (1, 28) and "data" in ans:
-                return ans["data"]
-    except Exception:
-        pass
-    return None
-
-
-def resolve_system(domain: str, qtype: int) -> str | None:
-    """系统 DNS 解析（等价于原模块在未指定 ProxyDNS 时走系统解析）。"""
-    family = socket.AF_INET6 if qtype == 28 else socket.AF_INET
-    try:
-        infos = socket.getaddrinfo(domain, None, family, socket.SOCK_STREAM)
-        for info in infos:
-            addr = info[4][0]
-            if "%" in addr:
-                addr = addr.split("%", 1)[0]
-            return addr
-    except OSError:
+        # 使用 dnspython 的 DoH 查询
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout * 2
+        
+        # 配置 DoH
+        resolver.use_doh = True
+        resolver.doh_url = doh_url
+        # DoH 需要指定一个 DNS 服务器（会被 DoH 覆盖）
+        resolver.nameservers = ['1.1.1.1']
+        
+        answers = resolver.resolve(domain, rdtype)
+        for rdata in answers:
+            return str(rdata)
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
         pass
     return None
 
 
 def resolve_domain(domain: str, dns_server: str | None = None, doh_url: str | None = None,
                    prefer_ipv6: bool = False, timeout: float = DNS_TIMEOUT) -> str | None:
-    """按优先级解析域名到单个 IP：自定义 DNS / DoH / 系统 DNS。"""
+    """按优先级解析域名到单个 IP：DoH > 自定义 DNS > 系统 DNS。"""
     order = ([28, 1] if prefer_ipv6 else [1, 28])
+    
     for qtype in order:
         ip = None
-        if dns_server:
-            ip = resolve_with_dns_server(domain, dns_server, qtype)
-        elif doh_url:
+        # 优先 DoH（更可靠，不易被劫持）
+        if doh_url:
             ip = resolve_with_doh(domain, doh_url, qtype, timeout)
-        else:
+        if not ip and dns_server:
+            ip = resolve_with_dns_server(domain, dns_server, qtype)
+        if not ip:
             ip = resolve_system(domain, qtype)
+        
         if ip:
             return ip
+    
     return None
 
 
@@ -572,6 +459,93 @@ def resolve_many(domains: list, dns_server=None, doh_url=None,
             fut.result()  # 收集异常
     return result
 
+
+def resolve_domain_all(domain: str, dns_server: str | None = None, 
+                       doh_url: str | None = None, prefer_ipv6: bool = False) -> list:
+    """解析域名返回所有 IP 地址（用于 hosts 写入多条记录）。"""
+    order = ([28, 1] if prefer_ipv6 else [1, 28])
+    all_ips = []
+    
+    for qtype in order:
+        ips = []
+        if doh_url:
+            ips = _resolve_doh_all(domain, doh_url, qtype)
+        if not ips and dns_server:
+            ips = _resolve_dns_all(domain, dns_server, qtype)
+        if not ips:
+            ips = _resolve_system_all(domain, qtype)
+        all_ips.extend(ips)
+    
+    return all_ips
+
+
+def _resolve_system_all(domain: str, qtype: int) -> list:
+    """使用系统 DNS 解析所有 IP。"""
+    rdtype = 'A' if qtype == 1 else 'AAAA'
+    try:
+        answers = dns.resolver.resolve(domain, rdtype, lifetime=DNS_TIMEOUT)
+        return [str(rdata) for rdata in answers]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
+        return []
+
+
+def _resolve_dns_all(domain: str, server: str, qtype: int) -> list:
+    """使用指定 DNS 服务器解析所有 IP。"""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_TIMEOUT * 2
+    resolver.nameservers = [server]
+    
+    rdtype = 'A' if qtype == 1 else 'AAAA'
+    try:
+        answers = resolver.resolve(domain, rdtype)
+        return [str(rdata) for rdata in answers]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
+        return []
+
+
+def _resolve_doh_all(domain: str, doh_url: str, qtype: int) -> list:
+    """通过 DoH 解析所有 IP。"""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_TIMEOUT * 2
+    resolver.use_doh = True
+    resolver.doh_url = doh_url
+    resolver.nameservers = ['1.1.1.1']
+    
+    rdtype = 'A' if qtype == 1 else 'AAAA'
+    try:
+        answers = resolver.resolve(domain, rdtype)
+        return [str(rdata) for rdata in answers]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout):
+        return []
+
+
+def check_dns_health(server: str) -> bool:
+    """检查 DNS 服务器是否可用。"""
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = [server]
+        resolver.timeout = 2
+        resolver.lifetime = 4
+        answers = resolver.resolve('example.com', 'A')
+        return len(answers) > 0
+    except Exception:
+        return False
+
+
+def get_public_dns_servers() -> list:
+    """返回常用公共 DNS 服务器列表。"""
+    return [
+        '223.5.5.5',    # 阿里 DNS
+        '119.29.29.29', # 腾讯 DNS
+        '8.8.8.8',      # Google DNS
+        '1.1.1.1',      # Cloudflare DNS
+        '114.114.114.114', # 114 DNS
+    ]
 
 # ---------------------------------------------------------------------------
 # hosts 引擎：原 HostsFileServiceImpl.HandleHosts 的忠实移植
@@ -1012,7 +986,7 @@ def flush_dns() -> bool:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="watt-accel",
-        description="Watt Toolkit(Steam++) 网络加速模块独立 CLI（零第三方依赖）",
+        description="Watt Toolkit(Steam++) 网络加速模块独立 CLI（基于 dnspython）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python3 watt_accel.py list\n"
