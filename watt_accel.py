@@ -24,6 +24,9 @@ argparse / subprocess / threading 等），可直接运行。
 用法：
   python3 watt_accel.py list                # 拉取并展示加速服务列表
   python3 watt_accel.py apply --all         # 加速全部服务(写入 hosts)
+  python3 watt_accel.py apply --default    # 默认模式：其它网站、网盘服务、Github、国外验证码平台、公共 CDN
+  python3 watt_accel.py apply --config mycfg.json  # 加载自定义配置文件
+  python3 watt_accel.py apply --exportcfg template.json #导出默认配置模板
   python3 watt_accel.py apply "Steam 社区"  # 加速指定服务
   python3 watt_accel.py apply --group "Steam" --dns 223.5.5.5
   python3 watt_accel.py restore             # 还原 hosts(删除标记区与备份区)
@@ -53,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib import request as urllib_request
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # 常量：与 SteamTools 原模块保持一致
@@ -76,8 +79,8 @@ CACHE_MAX_AGE_SECONDS = 6 * 3600
 
 # 请求体参数（原 GetAccelerateProjectGroupRequest，Platform/DeviceIdiom 沿用桌面端取值）
 SUBSCRIBE_BODY = {
-    "platform": 2,       # Windows/桌面平台（服务端按平台返回不同的加速项目）
-    "deviceIdiom": 0,    # Desktop
+    "platform": 2,
+    "deviceIdiom": 0,
     "version": 1,
 }
 USER_AGENT = "watt-accel/{} (SteamTools accelerator CLI, GPL-3.0)".format(__version__)
@@ -86,6 +89,46 @@ DNS_TIMEOUT = 4.0
 RESOLVE_MAX_WORKERS = 16
 SNI_MATCH_PORT = 443
 
+# ===================== 默认模式 --default 配置 =====================
+# --default 按分组名选中以下分组
+DEFAULT_ACCEL_GROUPS = [
+    "其它网站",
+    "网盘服务",
+    "Github",
+    "国外验证码平台",
+    "公共 CDN"
+]
+
+BUILTIN_DEFAULT_CONFIG = {
+    "names": [],
+    "group": [],
+    "all": False,
+    "dns": "223.5.5.5",
+    "doh": None,
+    "ipv6": False,
+    "target": None,
+    "hosts_file": None,
+    "dry_run": False,
+    "refresh": False,
+    "offline": False
+}
+
+CONFIG_TEMPLATE_COMMENT = '''
+# watt‑accel apply 配置文件模板(json)
+# 注意：--default 参数会忽略本配置的 names/group，固定加速：其它网站,网盘服务,Github,国外验证码平台,公共 CDN
+# 字段说明:
+# names: 字符串数组，服务名称关键字，对应命令行位置参数
+# group: 字符串数组，按分组名加速，对应 --group
+# all: bool，是否全部加速，对应 --all
+# dns: str|null，自定义DNS服务器IP，例如"223.5.5.5"
+# doh: str|null，DoH地址，例如"https://1.1.1.1/dns‑query"
+# ipv6: bool，优先IPv6解析
+# target: str|null，固定写入hosts的IP，跳过DNS解析
+# hosts_file: str|null，自定义hosts路径
+# dry_run: bool，仅预览不写入磁盘
+# refresh: bool，强制重新拉取订阅
+# offline: bool，仅使用本地缓存订阅
+'''
 
 # ---------------------------------------------------------------------------
 # 通用工具
@@ -119,6 +162,51 @@ def is_admin() -> bool:
     except Exception:
         return False
 
+# ========================= 配置加载导出工具 =========================
+def export_config_template(out_path: str):
+    template = dict(BUILTIN_DEFAULT_CONFIG)
+    out_text = CONFIG_TEMPLATE_COMMENT + json.dumps(template, ensure_ascii=False, indent=2)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(out_text)
+    info(f"配置模板已导出到 {out_path}")
+
+def load_custom_config(cfg_path: str) -> dict:
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"配置文件不存在: {cfg_path}")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            lines.append(line)
+    clean_json = "\n".join(lines)
+    cfg = json.loads(clean_json)
+    for k, v in BUILTIN_DEFAULT_CONFIG.items():
+        if k not in cfg:
+            cfg[k] = v
+    return cfg
+
+def merge_config_to_args(args, cfg: dict):
+    for key in BUILTIN_DEFAULT_CONFIG.keys():
+        val = cfg.get(key)
+        if val is not None:
+            setattr(args, key, val)
+    return args
+
+def select_default_groups_items(groups: list):
+    """--default模式：选中 DEFAULT_ACCEL_GROUPS 全部分组内项目"""
+    selected = []
+    seen = set()
+    for g in groups:
+        gname = g.get("Name", "")
+        if gname in DEFAULT_ACCEL_GROUPS:
+            for item in g.get("Items") or []:
+                key = id(item)
+                if key not in seen:
+                    seen.add(key)
+                    selected.append((g, item))
+    return selected
 
 # ---------------------------------------------------------------------------
 # 订阅：拉取 / 缓存 / 解析 加速服务列表
@@ -266,11 +354,9 @@ def collect_listen_domains(selected) -> list:
                 domains.append(d)
     return domains
 
-
 # ---------------------------------------------------------------------------
-# 域名解析：系统 DNS / 自定义 DNS(UDP+TCP) / DoH —— 均零依赖
+# 域名解析：系统 DNS / 自定义 DNS(UDP+TCP) / DoH
 # ---------------------------------------------------------------------------
-
 def _encode_name(name: str) -> bytes:
     out = b""
     for label in name.rstrip(".").split("."):
@@ -490,10 +576,8 @@ def resolve_many(domains: list, dns_server=None, doh_url=None,
 # ---------------------------------------------------------------------------
 # hosts 引擎：原 HostsFileServiceImpl.HandleHosts 的忠实移植
 # ---------------------------------------------------------------------------
-
 class DuplicateMarkError(Exception):
-    """hosts 文件中出现重复标记（对应原 HandleHostsFileException Code=5）。"""
-
+    pass
 
 def _get_mark(line_split: list) -> str | None:
     """原 GetMarkValue：识别 Steam++ 标记行（不区分大小写）。"""
@@ -609,8 +693,6 @@ def handle_hosts(is_update: bool, hosts: dict | None, path: str, dry_run: bool =
     for idx, line in enumerate(lines, start=1):
         line_split = line.split()
         line_value = line
-
-        # ---- 位于备份区内：解析 "#{行号} 原始行" 形式的备份项，行本身不写回 ----
         if backup_start_seen and not backup_end_seen:
             if (len(line_split) >= 3 and line_split[0].startswith("#")
                     and line_split[0][1:].isdigit()):
@@ -620,15 +702,13 @@ def handle_hosts(is_update: bool, hosts: dict | None, path: str, dry_run: bool =
                 if len(bak_split) >= 2:
                     backup_datas.setdefault(bak_split[1], (bak_no, bak_value))
             continue
-
         mark = _get_mark(line_split)
         if mark:
             if mark == MARK_END and not mark_start_seen:
-                continue  # 孤立的 End 标记：删除
+                continue
             if mark == BACKUP_MARK_END and not backup_start_seen:
                 continue
             if mark in (MARK_START, BACKUP_MARK_START):
-                # 标记前若紧跟空行，删掉该空行（避免累积空行）
                 if last_line_value is not None and not last_line_value.strip():
                     out_lines.pop()
                     last_line_value = out_lines[-1] if out_lines else None
@@ -644,71 +724,54 @@ def handle_hosts(is_update: bool, hosts: dict | None, path: str, dry_run: bool =
             elif mark == BACKUP_MARK_END:
                 backup_end_seen = True
             continue
-
-        # ---- 普通行有效性检查（原 HandleLineV2）----
         if len(line_split) < 2:
             out_lines.append(line_value)
             last_line_value = line_value
             continue
-        if line_split[0].startswith("#"):  # 注释行保留
+        if line_split[0].startswith("#"):
             out_lines.append(line_value)
             last_line_value = line_value
             continue
         if len(line_split) > 2 and not line_split[2].startswith("#"):
-            out_lines.append(line_value)  # 格式不正确，原样保留
+            out_lines.append(line_value)
             last_line_value = line_value
             continue
         if len(line_split) == 3 and line_split[2] == V1_MARK:
-            continue  # V1 旧格式行：移除
-
+            continue
         ip, domain = line_split[0], line_split[1]
-        domains[domain] = ip  # 去重记录（后出现者覆盖）
+        domains[domain] = ip
         match_domain = is_update and hosts and domain in hosts
-
         if mark_start_seen and not mark_end_seen:
-            # ---- 标记区内：仅保留本次选中的项，其余旧标记丢弃 ----
-            # 说明：原 C# 会把标记区内全部旧条目并入新标记区（应用场景为
-            # "停止→重新勾选→启动"，旧条目由 RemoveHostsByTag 清除）；CLI 的
-            # apply 语义为"精确替换"，故未选中的旧条目直接丢弃，
-            # 若有备份则在下文还原。
             if match_domain:
                 insert_mark[domain] = hosts[domain]
             continue
         else:
-            # ---- 标记区外：匹配项被移入标记区，原行进入备份 ----
             if match_domain:
                 if is_update:
                     insert_mark[domain] = ip
                 backup_insert[domain] = (idx, line_value)
                 continue
-
         out_lines.append(line_value)
         last_line_value = line_value
 
-    # ---- 更新：把本次要写入的全部条目并入 insert_mark ----
     if is_update:
         for d, ip in hosts.items():
             insert_mark[d] = ip
-
     is_restore = (not is_update) and (hosts is None)
     changed = False
 
-    # ---- 还原：把备份区记录的原始行插回原位置 ----
     if is_restore:
         for d, (bak_no, bak_value) in list(backup_datas.items()):
             pos = min(max(bak_no - 1, 0), len(out_lines))
             out_lines.insert(pos, bak_value)
             changed = True
     else:
-        # 更新时：还原"不再加速"的域名原行（仍在加速的保留在备份区）
         restore_items = [(d, v) for d, v in backup_datas.items() if d not in insert_mark]
         for d, (bak_no, bak_value) in restore_items:
             pos = min(max(bak_no - 1, 0), len(out_lines))
             out_lines.insert(pos, bak_value)
             backup_datas.pop(d)
             changed = True
-
-        # ---- 写入新标记区 ----
         if insert_mark:
             out_lines.append("")
             out_lines.append(MARK_START)
@@ -716,11 +779,6 @@ def handle_hosts(is_update: bool, hosts: dict | None, path: str, dry_run: bool =
                 out_lines.append("%s %s" % (ip, d))
             out_lines.append(MARK_END)
             changed = True
-
-        # ---- 写入新备份区：被替换的原行 + 仍加速且原有备份的项 ----
-        # 说明：原 C# 实现把"仍加速的旧备份"以裸行重写（会导致二次 apply 后
-        # 备份退化为不可还原）；此处改为始终保留 "#行号 原始行" 形式，
-        # 保证 restore 在多次 apply 后仍能精确还原。
         backup_lines = []
         for d, (bak_no, bak_value) in backup_insert.items():
             backup_lines.append("#%d %s" % (bak_no, bak_value))
@@ -733,24 +791,17 @@ def handle_hosts(is_update: bool, hosts: dict | None, path: str, dry_run: bool =
             out_lines.extend(backup_lines)
             out_lines.append(BACKUP_MARK_END)
             changed = True
-
-    # 最终差异判断：覆盖"仅删除孤立标记/V1 行"等未显式置位的场景
     changed = changed or out_lines != lines
-
     if changed and not dry_run:
         write_hosts(path, out_lines, encoding, has_trailing_newline, bom)
-
     return {
         "lines": out_lines,
         "changed": changed,
         "encoding": encoding,
         "inserted": len(insert_mark) if is_update else 0,
-        "restored": len(backup_datas) if is_restore else len(restore_items) if not is_restore else 0,
     }
 
-
 def contains_hosts_tag(path: str) -> bool:
-    """原 ContainsHostsByTag：是否存在 Steam++ 标记区。"""
     if not os.path.exists(path):
         return False
     try:
@@ -761,9 +812,7 @@ def contains_hosts_tag(path: str) -> bool:
     except Exception:
         return False
 
-
 def read_marker_entries(path: str) -> dict:
-    """读取当前标记区内的 domain -> ip（用于 status）。"""
     encoding, lines, _, _ = read_hosts(path)
     result = {}
     in_marker = False
@@ -779,13 +828,10 @@ def read_marker_entries(path: str) -> dict:
             result[ls[1]] = ls[0]
     return result
 
-
 # ---------------------------------------------------------------------------
-# 本地加速代理：SNI 透传（对应 Hosts 模式的本地代理，不做 MITM/证书/脚本）
+# 本地加速代理 SNI 透传
 # ---------------------------------------------------------------------------
-
 def parse_client_hello_sni(data: bytes) -> str | None:
-    """解析 TLS ClientHello 中的 SNI 扩展（纯手写解析，零依赖）。"""
     pos = 0
     try:
         while pos + 5 <= len(data):
@@ -796,14 +842,12 @@ def parse_client_hello_sni(data: bytes) -> str | None:
                 break
             record = data[pos:pos + rlen]
             pos += rlen
-            if rtype != 22:  # handshake
+            if rtype != 22:
                 continue
-            # handshake 头
             htype, hlen = record[0], struct.unpack(">I", b"\x00" + record[1:4])[0]
-            if htype != 1 or 4 + hlen > len(record):  # ClientHello
+            if htype != 1 or 4 + hlen > len(record):
                 continue
             hello = record[4:4 + hlen]
-            # client_version(2) + random(32) + session_id(1+len)
             p = 2 + 32
             sid_len = hello[p]
             p += 1 + sid_len
@@ -821,7 +865,7 @@ def parse_client_hello_sni(data: bytes) -> str | None:
                     break
                 edata = hello[p:p + elen]
                 p += elen
-                if etype == 0:  # server_name
+                if etype == 0:
                     if len(edata) >= 5:
                         name_list_len = struct.unpack(">H", edata[0:2])[0]
                         if name_list_len + 2 <= len(edata):
@@ -834,16 +878,13 @@ def parse_client_hello_sni(data: bytes) -> str | None:
         return None
     return None
 
-
 def domain_matches(sni: str, listen_domains: list) -> bool:
-    """SNI 域名是否命中加速项目（原 ListenDomainNames 后缀匹配）。"""
     sni = sni.rstrip(".").lower()
     for d in listen_domains:
         d = d.rstrip(".").lower()
         if sni == d or sni.endswith("." + d):
             return True
     return False
-
 
 async def _pipe(reader, writer):
     try:
@@ -861,11 +902,9 @@ async def _pipe(reader, writer):
         except Exception:
             pass
 
-
 async def _handle_client(reader, writer, listen_domains, dns_server, doh_url, prefer_ipv6):
     peer = writer.get_extra_info("peername")
     try:
-        # 读取完整 ClientHello
         buff = b""
         while len(buff) < 5:
             chunk = await reader.read(1024)
@@ -881,15 +920,12 @@ async def _handle_client(reader, writer, listen_domains, dns_server, doh_url, pr
             if not chunk:
                 return
             buff += chunk
-
         sni = parse_client_hello_sni(buff[:hello_len])
         if sni is None:
             warn("来自 %s 的连接无法解析 SNI，已拒绝" % str(peer))
             return
-
         accelerated = domain_matches(sni, listen_domains)
         if accelerated and (dns_server or doh_url):
-            # 加速：用自定义/DoH DNS 解析目标（等价于原 ProxyDNS/DoH 加速）
             ip = await asyncio.to_thread(
                 resolve_domain, sni, dns_server, doh_url, prefer_ipv6)
             if ip is None:
@@ -897,24 +933,19 @@ async def _handle_client(reader, writer, listen_domains, dns_server, doh_url, pr
                 ip = await asyncio.to_thread(resolve_system, sni, 1)
         else:
             ip = await asyncio.to_thread(resolve_system, sni, 1)
-
         if ip is None:
             warn("无法解析 %s，已拒绝连接" % sni)
             return
-
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, SNI_MATCH_PORT), timeout=15)
         except (OSError, ConnectionError, asyncio.TimeoutError) as e:
             warn("连接 %s(%s) 失败或超时: %s" % (sni, ip, e))
             return
-
         if accelerated:
             info("[加速] %s -> %s (%s)" % (peer[0], sni, ip))
-        # 先回放已读取的 ClientHello 字节
         upstream_writer.write(buff[:hello_len])
         await upstream_writer.drain()
-
         t1 = asyncio.create_task(_pipe(reader, upstream_writer))
         t2 = asyncio.create_task(_pipe(upstream_reader, writer))
         done, _ = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
@@ -931,7 +962,6 @@ async def _handle_client(reader, writer, listen_domains, dns_server, doh_url, pr
             writer.close()
         except Exception:
             pass
-
 
 async def serve(host: str, port: int, listen_domains: list,
                 dns_server=None, doh_url=None, prefer_ipv6=False):
@@ -950,11 +980,9 @@ async def serve(host: str, port: int, listen_domains: list,
     except KeyboardInterrupt:
         info("\n已停止。")
 
-
 # ---------------------------------------------------------------------------
 # 平台 DNS 缓存刷新
 # ---------------------------------------------------------------------------
-
 def flush_dns() -> bool:
     commands = []
     if os.name == "nt":
@@ -966,7 +994,6 @@ def flush_dns() -> bool:
         commands.append(["resolvectl", "flush-caches"])
         commands.append(["systemd-resolve", "--flush-caches"])
         commands.append(["nscd", "-i", "hosts"])
-
     for cmd in commands:
         try:
             subprocess.run(cmd, timeout=15,
@@ -979,11 +1006,9 @@ def flush_dns() -> bool:
          "Windows: ipconfig /flushdns；macOS: dscacheutil -flushcache")
     return False
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="watt-accel",
@@ -991,27 +1016,30 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python3 watt_accel.py list\n"
+               "  python3 watt_accel.py apply --default\n"
+               "  python3 watt_accel.py apply --config mycfg.json\n"
+               "  python3 watt_accel.py apply --exportcfg template.json\n"
                "  python3 watt_accel.py apply --all --dns 223.5.5.5\n"
-               "  python3 watt_accel.py apply \"Steam 社区\"\n"
-               "  python3 watt_accel.py restore\n"
-               "  python3 watt_accel.py serve --group Steam --dns 1.1.1.1\n",
+               "  python3 watt_accel.py restore\n",
     )
     p.add_argument("--version", action="version", version="watt-accel " + __version__)
     sub = p.add_subparsers(dest="command", required=True)
 
-    # list
     sp = sub.add_parser("list", help="拉取并展示加速服务列表")
     sp.add_argument("--refresh", action="store_true", help="强制重新拉取订阅")
     sp.add_argument("--filter", default="", help="按关键字过滤分组/服务名")
     sp.add_argument("--offline", action="store_true", help="仅使用本地缓存")
 
-    # apply
     sp = sub.add_parser("apply", help="应用加速：解析域名并写入 hosts（Steam++ 标记区）")
     sp.add_argument("names", nargs="*", help="服务名称关键字（可多个）")
     sp.add_argument("--group", action="append", default=[], metavar="名称", help="按分组名加速")
     sp.add_argument("--all", action="store_true", help="加速全部服务")
+    sp.add_argument("--default", action="store_true",
+                   help="【默认模式】加速分组：其它网站、网盘服务、Github、国外验证码平台、公共 CDN")
+    sp.add_argument("--config", metavar="CFG_JSON", help="加载自定义JSON配置文件")
+    sp.add_argument("--exportcfg", metavar="OUT_JSON", help="导出配置模板，仅输出文件，不执行加速")
     sp.add_argument("--dns", default=None, metavar="IP", help="指定 DNS 服务器解析(如 223.5.5.5)")
-    sp.add_argument("--doh", default=None, metavar="URL", help="DoH 地址(如 https://1.1.1.1/dns-query)")
+    sp.add_argument("--doh", default=None, metavar="URL", help="DoH 地址(如 https://1.1.1.1/dns‑query)")
     sp.add_argument("--ipv6", action="store_true", help="优先解析 AAAA(IPv6)")
     sp.add_argument("--target", default=None, metavar="IP", help="固定写入该 IP（配合 serve 用 127.0.0.1）")
     sp.add_argument("--hosts-file", default=None, help="hosts 文件路径（默认按平台）")
@@ -1019,16 +1047,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--refresh", action="store_true", help="强制重新拉取订阅")
     sp.add_argument("--offline", action="store_true", help="仅使用本地缓存")
 
-    # restore
     sp = sub.add_parser("restore", help="还原 hosts：删除 Steam++ 标记区与备份区")
     sp.add_argument("--hosts-file", default=None, help="hosts 文件路径（默认按平台）")
     sp.add_argument("--dry-run", action="store_true", help="只显示将要还原的内容，不落盘")
 
-    # status
     sp = sub.add_parser("status", help="查看当前加速状态")
     sp.add_argument("--hosts-file", default=None, help="hosts 文件路径（默认按平台）")
 
-    # serve
     sp = sub.add_parser("serve", help="启动本地加速代理(SNI 透传，HTTPS 443)")
     sp.add_argument("names", nargs="*", help="服务名称关键字（可多个）")
     sp.add_argument("--group", action="append", default=[], metavar="名称", help="按分组名")
@@ -1041,18 +1066,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--refresh", action="store_true", help="强制重新拉取订阅")
     sp.add_argument("--offline", action="store_true", help="仅使用本地缓存")
 
-    # flushdns
     sub.add_parser("flushdns", help="刷新系统 DNS 缓存")
-
     return p
 
-
 def _get_groups(args) -> list:
-    if args.offline:
+    if getattr(args, "offline", False):
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return load_subscribe(force_refresh=getattr(args, "refresh", False))
-
 
 def cmd_list(args) -> int:
     groups = _get_groups(args)
@@ -1060,7 +1081,6 @@ def cmd_list(args) -> int:
     hosts_path = default_hosts_path()
     if contains_hosts_tag(hosts_path):
         current = read_marker_entries(hosts_path)
-
     kw = (args.filter or "").lower()
     total_domains = 0
     for g in groups:
@@ -1086,14 +1106,37 @@ def cmd_list(args) -> int:
         len(groups), total_domains, len(current)))
     return 0
 
-
 def cmd_apply(args) -> int:
     groups = _get_groups(args)
-    selected = select_items(groups, args.names, args.group, args.all)
+
+    if args.exportcfg:
+        if args.default or args.config or args.names or args.group or args.all:
+            eprint("错误：--exportcfg 只能单独使用，不能搭配 --default / --config / names / --group / --all")
+            return 1
+        export_config_template(args.exportcfg)
+        return 0
+
+    if args.default and args.config:
+        eprint("错误：--default 和 --config 不能同时使用")
+        return 1
+
+    if not args.default and not args.config and not args.names and not args.group and not args.all:
+        eprint("错误：请指定 --default / --config 文件 / 服务名 / --group / --all")
+        return 1
+
+    if args.default:
+        info(f"[默认模式] 将加速分组：{', '.join(DEFAULT_ACCEL_GROUPS)}")
+        selected = select_default_groups_items(groups)
+    elif args.config:
+        cfg = load_custom_config(args.config)
+        args = merge_config_to_args(args, cfg)
+        selected = select_items(groups, args.names, args.group, args.all)
+    else:
+        selected = select_items(groups, args.names, args.group, args.all)
+
     if not selected:
         eprint("错误：未匹配到任何加速服务。可用 `list` 查看，或用 `--all` 加速全部。")
         return 1
-
     domains = collect_listen_domains(selected)
     if not domains:
         eprint("错误：所选服务没有可用的 ListenDomainNames。")
@@ -1122,7 +1165,6 @@ def cmd_apply(args) -> int:
     if not is_admin() and not args.dry_run:
         warn("当前非管理员/root 权限，写入 %s 可能失败（Windows 请以管理员运行，Linux/macOS 请用 sudo）。"
              % hosts_path)
-
     try:
         result = handle_hosts(is_update=True, hosts=hosts, path=hosts_path, dry_run=args.dry_run)
     except DuplicateMarkError as e:
@@ -1132,16 +1174,14 @@ def cmd_apply(args) -> int:
     except PermissionError:
         eprint("错误：没有权限写入 %s。" % hosts_path)
         return 1
-
     if args.dry_run:
-        info("---- [dry-run] 写入后的 hosts 内容 ----")
+        info("---- [dry‑run] 写入后的 hosts 内容 ----")
         for line in result["lines"]:
             info("    %s" % line)
     else:
         info("已完成：写入 %d 条加速记录到 %s" % (result["inserted"], hosts_path))
         flush_dns()
     return 0
-
 
 def cmd_restore(args) -> int:
     hosts_path = args.hosts_file or default_hosts_path()
@@ -1153,17 +1193,14 @@ def cmd_restore(args) -> int:
     except PermissionError:
         eprint("错误：没有权限写入 %s。" % hosts_path)
         return 1
-
     if args.dry_run:
-        info("---- [dry-run] 还原后的 hosts 内容 ----")
+        info("---- [dry‑run] 还原后的 hosts 内容 ----")
         for line in result["lines"]:
             info("    %s" % line)
     else:
-        info("已还原 hosts，删除标记区，恢复 %d 条原始记录。" % (
-            sum(1 for l in result["lines"] if l and not l.startswith("#"))))
+        info("已还原 hosts，删除标记区。")
         flush_dns()
     return 0
-
 
 def cmd_status(args) -> int:
     hosts_path = args.hosts_file or default_hosts_path()
@@ -1179,7 +1216,6 @@ def cmd_status(args) -> int:
     else:
         info("加速状态：未加速（hosts 中无 Steam++ 标记区）")
     return 0
-
 
 def cmd_serve(args) -> int:
     groups = _get_groups(args)
@@ -1204,11 +1240,9 @@ def cmd_serve(args) -> int:
         return 1
     return 0
 
-
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
     try:
         if args.command == "list":
             return cmd_list(args)
@@ -1229,7 +1263,6 @@ def main(argv=None) -> int:
         eprint("错误：%s" % e)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
